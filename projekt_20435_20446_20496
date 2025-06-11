@@ -1,0 +1,256 @@
+import tensorflow as tf
+import numpy as np
+from datasets import load_dataset
+from PIL import Image
+import matplotlib.pyplot as plt
+import os
+from collections import Counter
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report
+import imagehash
+from tqdm import tqdm
+import matplotlib
+import threading
+import psutil
+import time
+
+matplotlib.use("Agg")  # 🔧 Bez GUI – tylko zapis do pliku
+
+# 🔧 Konfiguracja
+IMG_SIZE = 224
+BATCH_SIZE = 16
+EPOCHS = 20
+MAX_TRAIN_SAMPLES_PER_CLASS = 500
+MAX_TEST_SAMPLES = 200
+
+# Konfiguracja TensorFlow
+tf.config.threading.set_intra_op_parallelism_threads(4)
+tf.config.threading.set_inter_op_parallelism_threads(4)
+tf.config.optimizer.set_jit(True)
+tf.debugging.set_log_device_placement(False)
+
+data_augmentation = tf.keras.Sequential([
+    tf.keras.layers.RandomFlip("horizontal_and_vertical"),
+    tf.keras.layers.RandomZoom(0.1),
+    tf.keras.layers.RandomContrast(0.1),
+    tf.keras.layers.GaussianNoise(0.01),
+])
+
+
+def get_image_hash(img):
+    return str(imagehash.average_hash(img.convert("L").resize((64, 64))))
+
+
+def filter_duplicates(dataset, max_samples):
+    hashes, used = {}, []
+    balanced = {0: 0, 1: 0}
+    for ex in tqdm(dataset, desc="Filtering train"):
+        label = ex["label"]
+        if balanced[label] >= MAX_TRAIN_SAMPLES_PER_CLASS:
+            continue
+        h = get_image_hash(ex["image"])
+        if h not in hashes:
+            hashes[h] = True
+            used.append(ex)
+            balanced[label] += 1
+        if all(v >= MAX_TRAIN_SAMPLES_PER_CLASS for v in balanced.values()):
+            break
+    return used, hashes
+
+
+def filter_leakage(test_set, train_hashes):
+    filtered = []
+    balanced = {0: 0, 1: 0}
+    for ex in tqdm(test_set, desc="Filtering test"):
+        h = get_image_hash(ex["image"])
+        label = ex["label"]
+        if h not in train_hashes and balanced[label] < MAX_TEST_SAMPLES // 2:
+            filtered.append(ex)
+            balanced[label] += 1
+        if all(v >= MAX_TEST_SAMPLES // 2 for v in balanced.values()):
+            break
+    return filtered
+
+
+def preprocess_dataset(dataset_split, augment=False):
+    images = []
+    labels = []
+    for ex in dataset_split:
+        img = ex["image"].convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+        img = np.array(img, dtype=np.float32) / 255.0
+        if np.isnan(img).any():
+            continue
+        images.append(img)
+        labels.append(ex["label"])
+
+    images = np.array(images)
+    labels = np.array(labels)
+
+    ds = tf.data.Dataset.from_tensor_slices((images, labels))
+    ds = ds.shuffle(buffer_size=1000).batch(BATCH_SIZE)
+
+    if augment:
+        def augment_fn(x, y):
+            # Usunięto tf.expand_dims, bo batch jest już dodawany przez .batch()
+            return data_augmentation(x, training=True), y
+
+        ds = ds.map(augment_fn, num_parallel_calls=tf.data.AUTOTUNE)
+
+    return ds.prefetch(tf.data.AUTOTUNE)
+
+
+def calculate_class_weights(labels):
+    weights = compute_class_weight(class_weight='balanced', classes=np.array([0, 1]), y=labels)
+    return dict(zip([0, 1], weights))
+
+
+def create_model():
+    inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    base_model = tf.keras.applications.MobileNetV2(
+        include_top=False,
+        weights="imagenet",
+        input_shape=(IMG_SIZE, IMG_SIZE, 3),
+        alpha=1.0
+    )
+    base_model.trainable = False
+
+    # Przeniesienie augmentacji do modelu
+    x = inputs
+    x = data_augmentation(x)
+    x = base_model(x, training=False)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    x = tf.keras.layers.Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01))(x)
+    outputs = tf.keras.layers.Dense(1, activation='sigmoid')(x)
+    model = tf.keras.Model(inputs, outputs)
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-4),
+        loss='binary_crossentropy',
+        metrics=['accuracy', tf.keras.metrics.Precision(name='precision'), tf.keras.metrics.Recall(name='recall')]
+    )
+    return model, base_model
+
+
+def extended_evaluation(model, test_ds):
+    y_true, y_pred = [], []
+    for x, y in tqdm(test_ds.unbatch().take(MAX_TEST_SAMPLES)):
+        pred = model.predict(tf.expand_dims(x, 0), verbose=0)[0][0]
+        y_true.append(y.numpy())
+        y_pred.append(pred)
+
+    y_pred_class = np.round(y_pred)
+    print("\n📊 Raport klasyfikacji:\n")
+    print(classification_report(y_true, y_pred_class))
+
+    plt.figure()
+    plt.hist([np.array(y_pred)[np.array(y_true) == 0],
+              np.array(y_pred)[np.array(y_true) == 1]], bins=20, alpha=0.7, label=["Real", "Fake"])
+    plt.title("Rozkład predykcji")
+    plt.xlabel("Wynik sigmoid")
+    plt.legend()
+    plt.savefig("histogram_predykcji.png")
+
+    errors = sorted(zip(y_true, y_pred, range(len(y_true))), key=lambda x: abs(x[1] - x[0]))[-5:]
+    print("\n🚨 Największe błędy:")
+    for true, pred, idx in errors:
+        print(f"Obraz {idx}: Prawdziwa klasa {true}, Predykcja {pred:.4f}")
+
+
+class ResourceMonitor(tf.keras.callbacks.Callback):
+    def on_epoch_begin(self, epoch, logs=None):
+        self.start_time = time.time()
+        self.cpu = psutil.cpu_percent()
+        self.ram = psutil.virtual_memory().percent
+
+    def on_epoch_end(self, epoch, logs=None):
+        print(f"\nResources - CPU: {psutil.cpu_percent()}%, RAM: {psutil.virtual_memory().percent}%")
+        print(f"Epoch time: {time.time() - self.start_time:.2f}s")
+
+
+if __name__ == "__main__":
+    print("📦 Ładowanie zbioru danych")
+    dataset = load_dataset("JamieWithofs/Deepfake-and-real-images-4")
+
+    print("🧹 Filtrowanie zbioru treningowego")
+    train_clean, train_hashes = filter_duplicates(dataset['train'], MAX_TRAIN_SAMPLES_PER_CLASS * 2)
+    test_clean = filter_leakage(dataset['test'], train_hashes)
+
+    val_dataset = dataset['validation'].select(range(MAX_TEST_SAMPLES))
+    val_clean = [{"image": ex["image"], "label": ex["label"]} for ex in val_dataset]
+
+    print("📊 Rozkład klas:", Counter([ex["label"] for ex in train_clean]))
+    class_weights = calculate_class_weights([ex["label"] for ex in train_clean])
+    print("⚖️ Wagi klas:", class_weights)
+
+    train_ds = preprocess_dataset(train_clean, augment=True)
+    val_ds = preprocess_dataset(val_clean)
+    test_ds = preprocess_dataset(test_clean)
+
+    # Sprawdź pierwszą partię danych
+    for x, y in train_ds.take(1):
+        print("\n🔍 Przykładowy batch danych:")
+        print("Shape:", x.shape)
+        print("Etykiety:", y.numpy())
+        plt.imshow(x[0].numpy())
+        plt.savefig("sample_image.png")
+        break
+
+    model, base_model = create_model()
+    model.summary()
+
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=5,
+            verbose=1,
+            restore_best_weights=True
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=2,
+            verbose=1
+        ),
+        ResourceMonitor(),
+        tf.keras.callbacks.CSVLogger('training_log.csv')
+    ]
+
+    print("\n🏋️ Trening modelu (faza 1)")
+    history = model.fit(
+        train_ds,
+        epochs=EPOCHS,
+        validation_data=val_ds,
+        steps_per_epoch=len(train_clean) // BATCH_SIZE,
+        validation_steps=len(val_clean) // BATCH_SIZE,
+        class_weight=class_weights,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    print("\n🧪 Ewaluacja")
+    extended_evaluation(model, test_ds)
+
+    print("\n🔓 Fine-tuning (faza 2)")
+    base_model.trainable = True
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-5),
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
+    model.fit(
+        train_ds,
+        epochs=EPOCHS // 2,
+        validation_data=val_ds,
+        steps_per_epoch=len(train_clean) // BATCH_SIZE,
+        validation_steps=len(val_clean) // BATCH_SIZE,
+        class_weight=class_weights,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    print("\n🎯 Finalna ewaluacja")
+    extended_evaluation(model, test_ds)
+
+    model.save("deepfake_model.keras")
+    print("\n💾 Model zapisany jako deepfake_model.keras")
